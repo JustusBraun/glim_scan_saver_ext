@@ -4,6 +4,9 @@
 #include <glim/common/cloud_deskewing.hpp>
 #include <glim/mapping/callbacks.hpp>
 
+#include <gtsam_points/types/point_cloud_cpu.hpp>
+
+#include <algorithm>
 #include <thread>
 #include <filesystem>
 #include <format>
@@ -34,6 +37,15 @@ private:
     *   @brief Deskews and saves frames from the queue_
     */
     void threadRun();
+
+    /**
+    *   @brief Prepare a raw frame for deskewing.
+    *
+    *   Removes invalid points and sorts by time.
+    *   We cannot use the Glim preprocessor for this because we cannot
+    *   disable downsampling.
+    */
+    glim::RawPoints::Ptr prepare_raw_points(const glim::RawPoints::ConstPtr& cloud) const;
 
 private:
     // Queue to store the incomming frames
@@ -79,7 +91,19 @@ void GlimScanSaver::at_exit(const std::string& dump_path)
     thread_.join();
 
     // Move our temp directory to the dump directory
-    std::filesystem::rename(output_dir_, std::filesystem::path(dump_path) / "deskewed_scans");
+    std::filesystem::path new_dir = std::filesystem::path(dump_path) / "deskewed_scans";
+    try
+    {
+        if (std::filesystem::exists(new_dir))
+        {
+            std::filesystem::remove_all(new_dir);
+        }
+        std::filesystem::rename(output_dir_, new_dir);
+    }
+    catch(std::filesystem::filesystem_error& err)
+    {
+        logger_->error("Error while moving tmp directory to dump directory: {}", err.what());
+    }
 
     logger_->info("First frame timestamp: {} Last frame timestamp: {}", first_stamp_.value_or(0), last_stamp_);
 }
@@ -127,7 +151,6 @@ void GlimScanSaver::threadRun()
     }
     
     glim::CloudDeskewing deskew;
-    size_t i = 0;
     // pop_wait waits until a frame comes or end of data flag is set on the queue
     while(auto opt = queue_.pop_wait())
     {
@@ -144,15 +167,17 @@ void GlimScanSaver::threadRun()
           imu_pred_poses[i].linear() = Eigen::Quaterniond(imu[7], imu[4], imu[5], imu[6]).toRotationMatrix();
         }
         
+        // std::vector<Eigen::Vector4d> deskewed(frame->frame->points, frame->frame->points + frame->frame->num_points);
         std::vector<Eigen::Vector4d> deskewed;
         if (frame->raw_frame->raw_points)
         {
+            const auto raw_points = prepare_raw_points(frame->raw_frame->raw_points);
             deskewed = deskew.deskew(
                 frame->T_lidar_imu.inverse(),
                 imu_pred_times, imu_pred_poses,
-                frame->raw_frame->raw_points->stamp,
-                frame->raw_frame->raw_points->times,
-                frame->raw_frame->raw_points->points
+                raw_points->stamp,
+                raw_points->times,
+                raw_points->points
             );
         }
         else
@@ -167,7 +192,7 @@ void GlimScanSaver::threadRun()
         }
 
         // Write the deskewed frame
-        const fs::path filename = output_dir_ / std::format("{}.ply", i);
+        const fs::path filename = output_dir_ / std::format("{}.ply", frame->id);
         
         // Convert points to happly format
         std::vector<std::array<double, 3>> vertices(deskewed.size());
@@ -182,8 +207,43 @@ void GlimScanSaver::threadRun()
         happly::PLYData ply_out;
         ply_out.addVertexPositions(vertices);
         ply_out.write(filename, happly::DataFormat::Binary);
-        i++;
     }
+}
+
+glim::RawPoints::Ptr GlimScanSaver::prepare_raw_points(const glim::RawPoints::ConstPtr& cloud) const
+{
+    auto result = std::make_shared<glim::RawPoints>(*cloud);
+    auto frame = std::make_shared<gtsam_points::PointCloud>();
+    frame->num_points = result->size();
+    frame->times = const_cast<double*>(result->times.data());
+    frame->points = const_cast<Eigen::Vector4d*>(result->points.data());
+
+    std::vector<int> indices;
+    // Find all valid points
+    for (size_t i = 0; i < result->points.size(); i++)
+    {
+        if (result->points[i].allFinite())
+        {
+            indices.push_back(i);
+        }
+    }
+
+    // Deskewing expects the points to be sorted by time
+    std::sort(indices.begin(), indices.end(), [&](const int lhs, const int rhs) { return frame->times[lhs] < frame->times[rhs]; });
+    frame = gtsam_points::sample(frame, indices);
+
+    // Shrink to fit the new number of points
+    result->points.resize(frame->num_points);
+    result->times.resize(frame->num_points);
+    // Copy the result
+    result->points.assign(frame->points, frame->points + frame->size());
+    result->times.assign(frame->times, frame->times + frame->size());
+    // Clear all other attributes
+    result->colors.clear();
+    result->intensities.clear();
+    result->rings.clear();
+    result->stamp = cloud->stamp;
+    return result;
 }
 
 } // glim_scan_saver_ext

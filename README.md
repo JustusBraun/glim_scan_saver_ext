@@ -49,9 +49,13 @@ export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
 # Usage
 
 To activate the plugin, add the library name to the `extension_modules` list in GLIMs [config_ros.json](https://github.com/koide3/glim/blob/638ab8e26e8834d976b5efe6815e450b717bd916/config/config_ros.json) configuration file.
+By default the plugin exports the preprocessed (downsampled) scans.
+If you want to export the full resolution lidar scans, you can set `keep_raw_points` to `true` in the same configuration file.
 
 ```json
 "glim_ros": {
+    ...
+    "keep_raw_points": true // SET THIS TO TRUE IF YOU WANT FULL RESOLUTION LIDAR SCANS
     ...
     // Extension modules
     "extension_modules": [
